@@ -288,72 +288,114 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   // mit klaren Grenzen statt 1-km-Treppen. Die Kachel wird mit Rand geladen, damit keine Nähte entstehen.
   const CAN_BLUR = "filter" in CanvasRenderingContext2D.prototype;
   const STEPV = 42;   // Grauwert pro Klasse im Hilfsbild
-  const RadarLayer = L.GridLayer.extend({
-    createTile(coords, done) {
-      const size = this.getTileSize();
-      const tile = document.createElement("canvas");
-      tile.width = size.x; tile.height = size.y;
+  const TILE = 512;
+  const EMPTY = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+
+  // ---------- Ladesteuerung ----------
+  // Höchstens 8 Radar-Anfragen gleichzeitig. Das gerade gezeigte Bild hat Vorrang.
+  const MAX_PAR = 8; let active = 0; const queue = [];
+  function enqueue(job, prio) {
+    return new Promise((res, rej) => {
+      const run = () => Promise.resolve().then(job).then(res, rej);
+      prio ? queue.unshift(run) : queue.push(run);
+      pump();
+    });
+  }
+  function pump() {
+    while (active < MAX_PAR && queue.length) {
+      const run = queue.shift(); active++;
+      run().finally(() => { active--; pump(); });
+    }
+  }
+
+  // Fertige Kacheln landen als kleine PNG-Dateien im Speicher (Blob-URL), nicht als Canvas.
+  // So können alle 25 Zeitpunkte vorgeladen sein, ohne dass der Grafikspeicher volläuft.
+  const tileCache = new Map();   // "zeit|z|x|y" -> Promise<url>
+  const CACHE_MAX = 900;
+  function clearTileCache() {
+    tileCache.forEach(p => p.then(u => u !== EMPTY && URL.revokeObjectURL(u), () => {}));
+    tileCache.clear();
+  }
+  function trimTileCache() {
+    if (tileCache.size <= CACHE_MAX) return;
+    const old = [...tileCache.keys()].slice(0, tileCache.size - CACHE_MAX + 100);
+    old.forEach(k => { tileCache.get(k).then(u => u !== EMPTY && URL.revokeObjectURL(u), () => {}); tileCache.delete(k); });
+  }
+
+  // Eine Kachel rechnen: DWD-WMS laden, in Regenklassen übersetzen, weich zeichnen, neu einfärben.
+  // Glättung: Klassenfeld weichzeichnen und wieder in Klassen schneiden. Ergibt runde Konturen
+  // mit klaren Grenzen statt 1-km-Treppen. Die Kachel wird mit Rand geladen, damit keine Nähte entstehen.
+  function renderTile(time, coords, prio, run) {
+    const key = `${time}|${coords.z}|${coords.x}|${coords.y}`;
+    if (tileCache.has(key)) return tileCache.get(key);
+    const p = enqueue(async () => {
+      if (run !== undefined && run !== preloadRun) throw new Error("veraltet");
       const crs = L.CRS.EPSG3857;
-      const nwPx = coords.scaleBy(size), sePx = nwPx.add(size);
+      const nwPx = L.point(coords.x * TILE, coords.y * TILE), sePx = nwPx.add([TILE, TILE]);
       const nwLL = map.unproject(nwPx, coords.z), seLL = map.unproject(sePx, coords.z);
       const p1 = crs.project(nwLL), p2 = crs.project(seLL);
-      const res = (p2.x - p1.x) / size.x;                       // projizierte Meter pro Pixel
+      const res = (p2.x - p1.x) / TILE;                          // projizierte Meter pro Pixel
       const lat = (nwLL.lat + seLL.lat) / 2 * Math.PI / 180;
       const cellPx = 1000 / Math.cos(lat) / res;                 // ein 1-km-Rasterfeld in Pixeln
       const blur = CAN_BLUR ? Math.min(24, cellPx * 0.6) : 0;
       const pad = blur >= 0.5 ? Math.ceil(blur * 2) + 2 : 0;
-      const W = size.x + 2 * pad, H = size.y + 2 * pad;
+      const W = TILE + 2 * pad, H = TILE + 2 * pad;
       const bbox = [p1.x - pad * res, p2.y - pad * res, p2.x + pad * res, p1.y + pad * res].join(",");
       const url = `${WMS}?service=WMS&version=1.3.0&request=GetMap&layers=${LAYER}&styles=&format=image/png&transparent=true` +
-        `&crs=EPSG:3857&width=${W}&height=${H}&bbox=${bbox}&time=${this.options.time}`;
-      const layer = this;
-      enqueue(() => {
-        if (!layer._map) { done(null, tile); return Promise.resolve(); }   // Ebene inzwischen verworfen
-        return fetch(url).then(r => { if (!r.ok) throw new Error(r.status); return r.blob(); }).then(createImageBitmap).then(bmp => {
-        // 1. DWD-Farben in Klassen übersetzen (0 = kein Regen, 1..5 = Stufen) als Graubild
-        const src = document.createElement("canvas"); src.width = W; src.height = H;
-        const sctx = src.getContext("2d", { willReadFrequently: true });
-        sctx.drawImage(bmp, 0, 0);
-        const si = sctx.getImageData(0, 0, W, H), s = si.data;
-        let any = false;
-        for (let i = 0; i < s.length; i += 4) {
-          const c = s[i + 3] === 255 ? LUT.get((s[i] << 16) | (s[i + 1] << 8) | s[i + 2]) : undefined;
-          const v = c === undefined ? 0 : (c + 1) * STEPV;
-          if (v) any = true;
-          s[i] = s[i + 1] = s[i + 2] = v; s[i + 3] = 255;
-        }
-        if (!any) { done(null, tile); return; }
-        sctx.putImageData(si, 0, 0);
-        // 2. Weichzeichnen
-        const soft = document.createElement("canvas"); soft.width = W; soft.height = H;
-        const fctx = soft.getContext("2d", { willReadFrequently: true });
-        if (blur >= 0.5) fctx.filter = `blur(${blur.toFixed(1)}px)`;
-        fctx.drawImage(src, 0, 0);
-        const fd = fctx.getImageData(pad, pad, size.x, size.y), f = fd.data;
-        // 3. Zurück in Klassen schneiden und einfärben
-        for (let i = 0; i < f.length; i += 4) {
-          const c = Math.round(f[i] / STEPV) - 1;
-          if (c < 0) { f[i + 3] = 0; continue; }
-          const t = classRGBA[Math.min(c, 4)]; f[i] = t[0]; f[i + 1] = t[1]; f[i + 2] = t[2]; f[i + 3] = t[3];
-        }
-        tile.getContext("2d").putImageData(fd, 0, 0);
-        done(null, tile);
-      }).catch(err => done(err, tile));
-      }, layer === frames[idx]?.layer);
-      return tile;
+        `&crs=EPSG:3857&width=${W}&height=${H}&bbox=${bbox}&time=${time}`;
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(r.status);
+      const bmp = await createImageBitmap(await r.blob());
+      // 1. DWD-Farben in Klassen übersetzen (0 = kein Regen, 1..5 = Stufen) als Graubild
+      const src = document.createElement("canvas"); src.width = W; src.height = H;
+      const sctx = src.getContext("2d", { willReadFrequently: true });
+      sctx.drawImage(bmp, 0, 0); bmp.close?.();
+      const si = sctx.getImageData(0, 0, W, H), s = si.data;
+      let any = false;
+      for (let i = 0; i < s.length; i += 4) {
+        const c = s[i + 3] === 255 ? LUT.get((s[i] << 16) | (s[i + 1] << 8) | s[i + 2]) : undefined;
+        const v = c === undefined ? 0 : (c + 1) * STEPV;
+        if (v) any = true;
+        s[i] = s[i + 1] = s[i + 2] = v; s[i + 3] = 255;
+      }
+      if (!any) return EMPTY;
+      sctx.putImageData(si, 0, 0);
+      // 2. Weichzeichnen
+      const soft = document.createElement("canvas"); soft.width = W; soft.height = H;
+      const fctx = soft.getContext("2d", { willReadFrequently: true });
+      if (blur >= 0.5) fctx.filter = `blur(${blur.toFixed(1)}px)`;
+      fctx.drawImage(src, 0, 0);
+      const fd = fctx.getImageData(pad, pad, TILE, TILE), f = fd.data;
+      // 3. Zurück in Klassen schneiden und einfärben
+      for (let i = 0; i < f.length; i += 4) {
+        const c = Math.round(f[i] / STEPV) - 1;
+        if (c < 0) { f[i + 3] = 0; continue; }
+        const t = classRGBA[Math.min(c, 4)]; f[i] = t[0]; f[i + 1] = t[1]; f[i + 2] = t[2]; f[i + 3] = t[3];
+      }
+      const out = document.createElement("canvas"); out.width = TILE; out.height = TILE;
+      out.getContext("2d").putImageData(fd, 0, 0);
+      const blob = await new Promise(res => out.toBlob(res, "image/png"));
+      src.width = soft.width = out.width = 0;   // Grafikspeicher sofort freigeben
+      return URL.createObjectURL(blob);
+    }, prio);
+    tileCache.set(key, p);
+    p.catch(() => tileCache.delete(key));   // Fehler nicht cachen, später neu versuchen
+    trimTileCache();
+    return p;
+  }
+
+  const RadarLayer = L.GridLayer.extend({
+    createTile(coords, done) {
+      const img = document.createElement("img");
+      img.alt = ""; img.decoding = "async";
+      renderTile(this.options.time, coords, true).then(u => {
+        img.onload = () => done(null, img);
+        img.onerror = e => done(e, img);
+        img.src = u;
+      }, err => done(err, img));
+      return img;
     }
   });
-
-  // ---------- Ladesteuerung ----------
-  // Höchstens 6 Radar-Anfragen gleichzeitig. Das gerade gezeigte Bild hat Vorrang.
-  const MAX_PAR = 6; let active = 0; const queue = [];
-  function enqueue(job, prio) { prio ? queue.unshift(job) : queue.push(job); pump(); }
-  function pump() {
-    while (active < MAX_PAR && queue.length) {
-      const job = queue.shift(); active++;
-      Promise.resolve().then(job).catch(() => {}).finally(() => { active--; pump(); });
-    }
-  }
 
   // ---------- Zustand ----------
   let frames = [];     // {t: Date, mmh: number|null, layer}
@@ -388,7 +430,9 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     } catch {
       pointOk = false;
     }
-    dropLayers(true);
+    preloadRun++;
+    if (shown) { map.removeLayer(shown); shown = null; }
+    clearTileCache();
     frames = times.map((t, i) => ({ t, mmh: values ? values[i] : null }));
     idx = 0;
     document.querySelectorAll(".sk").forEach(el => el.classList.remove("sk"));
@@ -398,48 +442,58 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     select(0);
   }
 
-  // Nur das gewählte Bild lädt sofort. Die übrigen Zeitpunkte folgen nacheinander im Hintergrund,
-  // sobald das aktuelle Bild steht. Beim Verschieben oder Zoomen werden sie verworfen und später neu geladen.
-  let preloadRun = 0;
-  function ensureLayer(i) {
-    const f = frames[i];
-    if (!f.layer) {
-      f.layer = new RadarLayer({ time: f.t.toISOString(), tileSize: 512, opacity: 0, zIndex: 300, updateWhenIdle: true, keepBuffer: 0 });
-      f.layer.on("loading load", updLoading);
-      f.layer.on("tileerror", () => { if (f.layer === frames[idx]?.layer) tileErr = true; });
-    }
-    if (!f.layer._map) f.layer.addTo(map);
-    return f.layer;
+  // Auf der Karte liegt immer nur eine Radar-Ebene: die des gewählten Zeitpunkts.
+  // Die übrigen Zeitpunkte werden im Hintergrund für den sichtbaren Ausschnitt vorberechnet,
+  // sobald das aktuelle Bild steht. Der Wechsel ist dann sofort da.
+  let preloadRun = 0, shown = null, tileErr = false;
+  function showFrame(i) {
+    const f = frames[i]; if (!f) return;
+    const time = f.t.toISOString();
+    if (shown && shown.options.time === time) return;
+    const old = shown;
+    const layer = new RadarLayer({ time, tileSize: TILE, zIndex: 300, updateWhenIdle: true, keepBuffer: 1 });
+    layer.on("loading load", updLoading);
+    layer.on("tileerror", () => { if (layer === shown) { tileErr = true; updLoading(); } });
+    shown = layer; tileErr = false;
+    layer.addTo(map);
+    // Altes Bild erst entfernen, wenn das neue steht. Verhindert Flackern.
+    const swap = () => { if (old) map.removeLayer(old); };
+    layer.isLoading() ? layer.once("load", swap) : swap();
+    setTimeout(swap, 4000);
+    updLoading();
   }
-  function dropLayers(all) {
-    frames.forEach((f, j) => { if (f.layer && (all || j !== idx)) { map.removeLayer(f.layer); if (all) f.layer = null; } });
-  }
-  function rebuildRadar() {   // nach Theme-Wechsel oder neuem Datenstand: alles neu zeichnen
-    dropLayers(true);
+  function rebuildRadar() {   // nach Theme-Wechsel oder neuem Datenstand: alles neu rechnen
+    preloadRun++;
+    if (shown) { map.removeLayer(shown); shown = null; }
+    clearTileCache();
     if (frames.length) select(idx);
   }
   const whenLoaded = layer => new Promise(res => {
     if (!layer.isLoading()) return res();
-    const t = setTimeout(res, 15000);
+    const t = setTimeout(res, 20000);
     layer.once("load", () => { clearTimeout(t); res(); });
   });
   async function preload() {
     const run = ++preloadRun;
-    const cur = frames[idx]?.layer; if (!cur) return;
-    await whenLoaded(cur);
-    const order = frames.map((_, j) => j).filter(j => j !== idx).sort((a, b) => Math.abs(a - idx) - Math.abs(b - idx));
-    for (const j of order) {
+    if (!shown) return;
+    await whenLoaded(shown);
+    if (run !== preloadRun || !shown) return;
+    const coords = Object.values(shown._tiles || {}).map(t => t.coords);
+    // Zeitpunkte nach Nähe zum aktuellen sortieren, zukünftige zuerst; jeweils zwei gleichzeitig
+    const order = frames.map((_, j) => j).filter(j => j !== idx)
+      .sort((a, b) => (Math.abs(a - idx) - Math.abs(b - idx)) || (b - a));
+    for (let k = 0; k < order.length; k += 2) {
       if (run !== preloadRun) return;
-      await whenLoaded(ensureLayer(j));
+      await Promise.all(order.slice(k, k + 2).flatMap(j =>
+        coords.map(c => renderTile(frames[j].t.toISOString(), c, false, run).catch(() => {}))));
     }
   }
-  map.on("movestart", () => { preloadRun++; dropLayers(false); });
+  map.on("movestart", () => { preloadRun++; });   // wartende Vorlade-Aufträge verfallen beim Start
   map.on("moveend", () => preload());
 
-  let tileErr = false;
   function updLoading() {
-    const cur = frames[idx]?.layer, chip = $("loadchip");
-    if (cur && cur.isLoading()) { chip.hidden = false; chip.classList.remove("err"); $("loadtxt").textContent = "Radar lädt"; tileErr = false; return; }
+    const chip = $("loadchip");
+    if (shown && shown.isLoading()) { chip.hidden = false; chip.classList.remove("err"); $("loadtxt").textContent = "Radar lädt"; return; }
     if (tileErr) { chip.hidden = false; chip.classList.add("err"); $("loadtxt").textContent = "Radar unvollständig"; return; }
     chip.hidden = true;
   }
@@ -510,12 +564,10 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   }
 
   function select(i) {
-    const prev = idx;
     idx = Math.max(0, Math.min(frames.length - 1, i));
-    ensureLayer(idx);
-    frames.forEach((f, j) => f.layer && f.layer.setOpacity(j === idx ? 1 : 0));
-    if (prev !== idx || !frames.some((f, j) => j !== idx && f.layer && f.layer._map)) preload();
-    updLoading();
+    const first = !shown;
+    showFrame(idx);
+    if (first) preload();
     const f = frames[idx];
     const m = Math.round((f.t - Date.now()) / 60000);
     const rel = idx === 0 ? "jetzt" : m <= 0 ? "jetzt" : `in ${m} Min.`;
