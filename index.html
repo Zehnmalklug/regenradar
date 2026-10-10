@@ -130,6 +130,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(var(--sheet-h, 220px) + 12px); z-index: 600;
   border-radius: 12px; padding: 8px 12px; font-size: 12px; max-width: calc(100% - 32px); }
+.leaflet-image-layer.radar { transition: none !important; }
 .me { width: 16px; height: 16px; border-radius: 50%; background: var(--accent); border: 3px solid #fff; box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 25%, transparent); }
 /* Skeleton beim ersten Laden */
 .sk { color: transparent !important; white-space: nowrap; overflow: hidden; border-radius: 6px; background: linear-gradient(90deg, var(--line) 0 40%, color-mix(in srgb, var(--line) 45%, var(--panel-solid)) 50%, var(--line) 60% 100%);
@@ -292,7 +293,6 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   // mit klaren Grenzen statt 1-km-Treppen. Die Kachel wird mit Rand geladen, damit keine Nähte entstehen.
   const CAN_BLUR = "filter" in CanvasRenderingContext2D.prototype;
   const STEPV = 42;   // Grauwert pro Klasse im Hilfsbild
-  const TILE = 512;
   const EMPTY = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 
   // ---------- Ladesteuerung ----------
@@ -312,39 +312,51 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     }
   }
 
-  // Fertige Kacheln landen als kleine PNG-Dateien im Speicher (Blob-URL), nicht als Canvas.
-  // So können alle 25 Zeitpunkte vorgeladen sein, ohne dass der Grafikspeicher volläuft.
-  const tileCache = new Map();   // "zeit|z|x|y" -> Promise<url>
-  const CACHE_MAX = 900;
-  function clearTileCache() {
-    tileCache.forEach(p => p.then(u => u !== EMPTY && URL.revokeObjectURL(u), () => {}));
-    tileCache.clear();
+  // Ein Bild pro Zeitpunkt statt vieler Kacheln. Der DWD-Server braucht pro Anfrage
+  // 1 bis 3 Sekunden, fast unabhängig von der Bildgröße. Deshalb wird pro Zeitpunkt nur ein
+  // Bild angefragt, das den sichtbaren Ausschnitt plus einen Rand abdeckt. Kleines Verschieben
+  // lädt nichts nach; erst bei neuem Zoom oder größerem Verschieben wird ein neuer Ausschnitt gerechnet.
+  let view = null;          // aktueller Ausschnitt: {id, zoom, bounds, bbox, W, H, pad, blur}
+  let viewSeq = 0;
+  const frameCache = new Map();   // "ausschnitt|zeit" -> Promise<url>
+  function revokeWhere(pred) {
+    [...frameCache.keys()].forEach(k => {
+      if (!pred(k)) return;
+      const p = frameCache.get(k); frameCache.delete(k);
+      p.then(u => { if (u !== EMPTY && u !== shownUrl) URL.revokeObjectURL(u); }, () => {});
+    });
   }
-  function trimTileCache() {
-    if (tileCache.size <= CACHE_MAX) return;
-    const old = [...tileCache.keys()].slice(0, tileCache.size - CACHE_MAX + 100);
-    old.forEach(k => { tileCache.get(k).then(u => u !== EMPTY && URL.revokeObjectURL(u), () => {}); tileCache.delete(k); });
+  function makeView() {
+    const size = map.getSize(), z = map.getZoom();
+    const crs = L.CRS.EPSG3857;
+    // Ausschnitt: sichtbarer Bereich, auf jeder Seite um die halbe Breite/Höhe erweitert
+    const b = map.getBounds();
+    const sw = crs.project(b.getSouthWest()), ne = crs.project(b.getNorthEast());
+    const mx = (ne.x - sw.x) * 0.5, my = (ne.y - sw.y) * 0.5;
+    let W = size.x * 2, H = size.y * 2;
+    const scale = Math.min(1, 2048 / Math.max(W, H));          // Serverlimit und Speicher schonen
+    W = Math.round(W * scale); H = Math.round(H * scale);
+    const x0 = sw.x - mx, x1 = ne.x + mx, y0 = sw.y - my, y1 = ne.y + my;
+    const res = (x1 - x0) / W;
+    const lat = map.getCenter().lat * Math.PI / 180;
+    const cellPx = 1000 / Math.cos(lat) / res;                  // ein 1-km-Rasterfeld in Pixeln
+    const blur = CAN_BLUR ? Math.min(24, cellPx * 0.6) : 0;
+    const pad = blur >= 0.5 ? Math.ceil(blur * 2) + 2 : 0;
+    const bounds = L.latLngBounds(crs.unproject(L.point(x0, y0)), crs.unproject(L.point(x1, y1)));
+    return { id: ++viewSeq, zoom: z, bounds, x0, x1, y0, y1, res, W, H, pad, blur };
+  }
+  function viewCovers(v) {
+    return v && v.zoom === map.getZoom() && v.bounds.contains(map.getBounds());
   }
 
-  // Eine Kachel rechnen: DWD-WMS laden, in Regenklassen übersetzen, weich zeichnen, neu einfärben.
-  // Glättung: Klassenfeld weichzeichnen und wieder in Klassen schneiden. Ergibt runde Konturen
-  // mit klaren Grenzen statt 1-km-Treppen. Die Kachel wird mit Rand geladen, damit keine Nähte entstehen.
-  function renderTile(time, coords, prio, run) {
-    const key = `${time}|${coords.z}|${coords.x}|${coords.y}`;
-    if (tileCache.has(key)) return tileCache.get(key);
+  function renderFrame(v, time, prio, run) {
+    const key = `${v.id}|${time}`;
+    if (frameCache.has(key)) return frameCache.get(key);
     const p = enqueue(async () => {
       if (run !== undefined && run !== preloadRun) throw new Error("veraltet");
-      const crs = L.CRS.EPSG3857;
-      const nwPx = L.point(coords.x * TILE, coords.y * TILE), sePx = nwPx.add([TILE, TILE]);
-      const nwLL = map.unproject(nwPx, coords.z), seLL = map.unproject(sePx, coords.z);
-      const p1 = crs.project(nwLL), p2 = crs.project(seLL);
-      const res = (p2.x - p1.x) / TILE;                          // projizierte Meter pro Pixel
-      const lat = (nwLL.lat + seLL.lat) / 2 * Math.PI / 180;
-      const cellPx = 1000 / Math.cos(lat) / res;                 // ein 1-km-Rasterfeld in Pixeln
-      const blur = CAN_BLUR ? Math.min(24, cellPx * 0.6) : 0;
-      const pad = blur >= 0.5 ? Math.ceil(blur * 2) + 2 : 0;
-      const W = TILE + 2 * pad, H = TILE + 2 * pad;
-      const bbox = [p1.x - pad * res, p2.y - pad * res, p2.x + pad * res, p1.y + pad * res].join(",");
+      const { W: w, H: hh, pad, res } = v;
+      const W = w + 2 * pad, H = hh + 2 * pad;
+      const bbox = [v.x0 - pad * res, v.y0 - pad * res, v.x1 + pad * res, v.y1 + pad * res].join(",");
       const url = `${WMS}?service=WMS&version=1.3.0&request=GetMap&layers=${LAYER}&styles=&format=image/png&transparent=true` +
         `&crs=EPSG:3857&width=${W}&height=${H}&bbox=${bbox}&time=${time}`;
       const r = await fetch(url);
@@ -358,70 +370,34 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
       let any = false;
       for (let i = 0; i < s.length; i += 4) {
         const c = s[i + 3] === 255 ? LUT.get((s[i] << 16) | (s[i + 1] << 8) | s[i + 2]) : undefined;
-        const v = c === undefined ? 0 : (c + 1) * STEPV;
-        if (v) any = true;
-        s[i] = s[i + 1] = s[i + 2] = v; s[i + 3] = 255;
+        const val = c === undefined ? 0 : (c + 1) * STEPV;
+        if (val) any = true;
+        s[i] = s[i + 1] = s[i + 2] = val; s[i + 3] = 255;
       }
-      if (!any) return EMPTY;
+      if (!any) { src.width = 0; return EMPTY; }
       sctx.putImageData(si, 0, 0);
-      // 2. Weichzeichnen
+      // 2. Weichzeichnen: Klassenfeld weich, dann wieder in Stufen schneiden = runde Konturen
       const soft = document.createElement("canvas"); soft.width = W; soft.height = H;
       const fctx = soft.getContext("2d", { willReadFrequently: true });
-      if (blur >= 0.5) fctx.filter = `blur(${blur.toFixed(1)}px)`;
+      if (v.blur >= 0.5) fctx.filter = `blur(${v.blur.toFixed(1)}px)`;
       fctx.drawImage(src, 0, 0);
-      const fd = fctx.getImageData(pad, pad, TILE, TILE), f = fd.data;
-      // 3. Zurück in Klassen schneiden und einfärben
+      const fd = fctx.getImageData(pad, pad, w, hh), f = fd.data;
+      // 3. Einfärben
       for (let i = 0; i < f.length; i += 4) {
         const c = Math.round(f[i] / STEPV) - 1;
         if (c < 0) { f[i + 3] = 0; continue; }
         const t = classRGBA[Math.min(c, 4)]; f[i] = t[0]; f[i + 1] = t[1]; f[i + 2] = t[2]; f[i + 3] = t[3];
       }
-      const out = document.createElement("canvas"); out.width = TILE; out.height = TILE;
+      const out = document.createElement("canvas"); out.width = w; out.height = hh;
       out.getContext("2d").putImageData(fd, 0, 0);
-      const blob = await new Promise(res => out.toBlob(res, "image/png"));
+      const blob = await new Promise(res2 => out.toBlob(res2, "image/png"));
       src.width = soft.width = out.width = 0;   // Grafikspeicher sofort freigeben
       return URL.createObjectURL(blob);
     }, prio);
-    tileCache.set(key, p);
-    p.catch(() => tileCache.delete(key));   // Fehler nicht cachen, später neu versuchen
-    trimTileCache();
+    frameCache.set(key, p);
+    p.catch(() => frameCache.delete(key));   // Fehler nicht cachen
     return p;
   }
-
-  // Eine einzige Radar-Ebene. Beim Wechsel des Zeitpunkts tauscht jede Kachel nur ihr Bild aus,
-  // sobald das neue fertig ist. Das alte bleibt so lange stehen: kein Ausblenden, kein Überlagern.
-  const RadarLayer = L.GridLayer.extend({
-    createTile(coords, done) {
-      const img = document.createElement("img");
-      img.alt = ""; img.decoding = "async";
-      const time = this.options.time;
-      img._want = time;
-      renderTile(time, coords, true).then(u => {
-        img.onload = () => { img.onload = null; done(null, img); };
-        img.onerror = e => done(e, img);
-        img.src = img._want === time ? u : EMPTY;
-      }, err => done(err, img));
-      return img;
-    },
-    setTime(time) {
-      if (this.options.time === time) return;
-      this.options.time = time;
-      const tiles = Object.values(this._tiles || {});
-      this._swapping = tiles.length;
-      tiles.forEach(t => {
-        const img = t.el; img._want = time;
-        renderTile(time, t.coords, true).then(u => {
-          if (img._want !== time) return;
-          if (u === EMPTY) { img.src = EMPTY; return; }
-          const pre = new Image(); pre.src = u;
-          (pre.decode ? pre.decode() : Promise.resolve()).catch(() => {}).then(() => { if (img._want === time) img.src = u; });
-        }, () => { if (this === shown) { tileErr = true; } })
-          .finally(() => { this._swapping--; updLoading(); });
-      });
-      updLoading();
-    },
-    busy() { return this.isLoading() || this._swapping > 0; }
-  });
 
   // ---------- Zustand ----------
   let frames = [];     // {t: Date, mmh: number|null, layer}
@@ -461,7 +437,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
       pointOk = false;
     }
     frames = times.map((t, i) => ({ t, mmh: values ? values[i] : null }));
-    dropOldTiles();
+    dropOldFrames();
     document.querySelectorAll(".sk").forEach(el => el.classList.remove("sk"));
     document.body.classList.remove("booting");
     $("where").textContent = `${p.label} · Stand ${fmt(new Date())}`;
@@ -479,66 +455,63 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     frames.forEach((f, j) => { const x = Math.abs(f.t - Date.now()); if (x < d) { d = x; best = j; } });
     return best;
   }
-  // Kacheln für Zeitpunkte, die nicht mehr in der Zeitleiste sind, aus dem Speicher werfen
-  function dropOldTiles() {
+  // Bilder für Zeitpunkte, die nicht mehr in der Zeitleiste sind, freigeben
+  function dropOldFrames() {
     const keep = new Set(frames.map(f => f.t.toISOString()));
-    [...tileCache.keys()].forEach(k => {
-      if (!keep.has(k.split("|")[0])) { tileCache.get(k).then(u => u !== EMPTY && URL.revokeObjectURL(u), () => {}); tileCache.delete(k); }
-    });
+    revokeWhere(k => !keep.has(k.split("|")[1]));
   }
 
   // Auf der Karte liegt immer nur eine Radar-Ebene: die des gewählten Zeitpunkts.
   // Die übrigen Zeitpunkte werden im Hintergrund für den sichtbaren Ausschnitt vorberechnet,
   // sobald das aktuelle Bild steht. Der Wechsel ist dann sofort da.
-  let preloadRun = 0, shown = null, tileErr = false;
+  let preloadRun = 0, tileErr = false, busy = false, shownUrl = null, wantKey = "";
+  const overlay = L.imageOverlay(EMPTY, [[0, 0], [0, 0]], { zIndex: 300, interactive: false, className: "radar" }).addTo(map);
+
+  // Zeitpunkt anzeigen. Das bisherige Bild bleibt stehen, bis das neue fertig dekodiert ist.
   function showFrame(i) {
     const f = frames[i]; if (!f) return;
-    const time = f.t.toISOString();
-    if (!shown) {
-      shown = new RadarLayer({ time, tileSize: TILE, zIndex: 300, updateWhenIdle: true, keepBuffer: 1 });
-      shown._swapping = 0;
-      shown.on("loading load", updLoading);
-      shown.on("tileerror", () => { tileErr = true; updLoading(); });
-      tileErr = false;
-      shown.addTo(map);
-    } else {
-      tileErr = false;
-      shown.setTime(time);
-    }
-    updLoading();
+    if (!viewCovers(view)) newView();
+    const v = view, time = f.t.toISOString(), key = `${v.id}|${time}`;
+    if (key === wantKey) return;
+    wantKey = key; busy = true; tileErr = false; updLoading();
+    renderFrame(v, time, true).then(async u => {
+      if (wantKey !== key) return;
+      if (u !== EMPTY) { const img = new Image(); img.src = u; try { await img.decode(); } catch {} }
+      if (wantKey !== key) return;
+      overlay.setUrl(u); overlay.setBounds(v.bounds); shownUrl = u;
+      busy = false; updLoading();
+    }, () => { if (wantKey === key) { busy = false; tileErr = true; updLoading(); } });
   }
-  function rebuildRadar() {   // nach Theme-Wechsel oder neuem Datenstand: alles neu rechnen
+  function newView() {
+    const old = view;
+    view = makeView();
     preloadRun++;
-    if (shown) { map.removeLayer(shown); shown = null; }
-    clearTileCache();
-    if (frames.length) select(idx);
+    // Bilder älterer Ausschnitte freigeben (das gerade angezeigte bleibt, bis es ersetzt ist)
+    if (old) revokeWhere(k => !k.startsWith(view.id + "|"));
   }
-  const whenLoaded = layer => new Promise(res => {
-    if (!layer.isLoading()) return res();
-    const t = setTimeout(res, 20000);
-    layer.once("load", () => { clearTimeout(t); res(); });
-  });
+  function rebuildRadar() {   // nach Theme-Wechsel: Farben sind eingebacken, also neu rechnen
+    revokeWhere(() => true);
+    wantKey = ""; view = null;
+    if (frames.length) { select(idx); preload(); }
+  }
   async function preload() {
-    const run = ++preloadRun;
-    if (!shown) return;
-    await whenLoaded(shown);
-    if (run !== preloadRun || !shown) return;
-    const coords = Object.values(shown._tiles || {}).map(t => t.coords);
-    // Zeitpunkte nach Nähe zum aktuellen sortieren, zukünftige zuerst; jeweils zwei gleichzeitig
+    const run = ++preloadRun, v = view;
+    if (!v || !frames.length) return;
+    // erst das sichtbare Bild, dann die übrigen Zeitpunkte: Nachbarn zuerst, Zukunft vor Vergangenheit
+    try { await renderFrame(v, frames[idx].t.toISOString(), true); } catch {}
     const order = frames.map((_, j) => j).filter(j => j !== idx)
       .sort((a, b) => (Math.abs(a - idx) - Math.abs(b - idx)) || (b - a));
-    for (let k = 0; k < order.length; k += 2) {
-      if (run !== preloadRun) return;
-      await Promise.all(order.slice(k, k + 2).flatMap(j =>
-        coords.map(c => renderTile(frames[j].t.toISOString(), c, false, run).catch(() => {}))));
-    }
+    await Promise.all(order.map(j => renderFrame(v, frames[j].t.toISOString(), false, run).catch(() => {})));
   }
-  map.on("movestart", () => { preloadRun++; });   // wartende Vorlade-Aufträge verfallen beim Start
-  map.on("moveend", () => preload());
+  map.on("moveend", () => {
+    if (viewCovers(view)) return;          // Ausschnitt reicht noch: nichts nachladen
+    wantKey = "";
+    if (frames.length) { select(idx); preload(); }
+  });
 
   function updLoading() {
     const chip = $("loadchip");
-    if (shown && shown.busy()) { chip.hidden = false; chip.classList.remove("err"); $("loadtxt").textContent = "Radar lädt"; return; }
+    if (busy) { chip.hidden = false; chip.classList.remove("err"); $("loadtxt").textContent = "Radar lädt"; return; }
     if (tileErr) { chip.hidden = false; chip.classList.add("err"); $("loadtxt").textContent = "Radar unvollständig"; return; }
     chip.hidden = true;
   }
