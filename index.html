@@ -18,7 +18,7 @@
 <link rel="preconnect" href="https://services.arcgisonline.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..24,400..600,0..1,0&icon_names=contrast,dark_mode,drag_indicator,light_mode,my_location,water_drop&display=block" media="print" onload="this.media='all'">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..24,400..600,0..1,0&icon_names=contrast,dark_mode,drag_indicator,light_mode,my_location,refresh,water_drop&display=block" media="print" onload="this.media='all'">
 <style>
 /* Layout: Antwort oben, Karte in der Mitte, Regenverlauf für deinen Ort unten als Zeitleiste */
 :root {
@@ -87,6 +87,7 @@ body { background: var(--bg); color: var(--fg); font: 15px/1.35 var(--font); ove
   width: 48px; height: 48px; border: 0; border-radius: 14px; color: var(--fg);
   display: grid; place-items: center; cursor: pointer; padding: 0;
 }
+.iconbtn.busy .ms { animation: spin .9s linear infinite; }
 .iconbtn .ms { font-size: 22px; display: block; margin-inline: auto; width: 22px; height: 22px; }
 .iconbtn small { display: block; font: 600 11px var(--font); margin-top: -3px; color: var(--muted); }
 button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -168,6 +169,9 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   <div class="btns">
     <button class="panel iconbtn" id="locate" aria-label="Meinen Standort verwenden">
       <span class="ms" aria-hidden="true">my_location</span>
+    </button>
+    <button class="panel iconbtn" id="reload" aria-label="Radar aktualisieren">
+      <span class="ms" aria-hidden="true">refresh</span>
     </button>
     <button class="panel iconbtn" id="theme" aria-label="Darstellung wechseln">
       <span><span class="ms" id="themeIco" aria-hidden="true">contrast</span><small id="themeLbl">Auto</small></span>
@@ -384,17 +388,39 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     return p;
   }
 
+  // Eine einzige Radar-Ebene. Beim Wechsel des Zeitpunkts tauscht jede Kachel nur ihr Bild aus,
+  // sobald das neue fertig ist. Das alte bleibt so lange stehen: kein Ausblenden, kein Überlagern.
   const RadarLayer = L.GridLayer.extend({
     createTile(coords, done) {
       const img = document.createElement("img");
       img.alt = ""; img.decoding = "async";
-      renderTile(this.options.time, coords, true).then(u => {
-        img.onload = () => done(null, img);
+      const time = this.options.time;
+      img._want = time;
+      renderTile(time, coords, true).then(u => {
+        img.onload = () => { img.onload = null; done(null, img); };
         img.onerror = e => done(e, img);
-        img.src = u;
+        img.src = img._want === time ? u : EMPTY;
       }, err => done(err, img));
       return img;
-    }
+    },
+    setTime(time) {
+      if (this.options.time === time) return;
+      this.options.time = time;
+      const tiles = Object.values(this._tiles || {});
+      this._swapping = tiles.length;
+      tiles.forEach(t => {
+        const img = t.el; img._want = time;
+        renderTile(time, t.coords, true).then(u => {
+          if (img._want !== time) return;
+          if (u === EMPTY) { img.src = EMPTY; return; }
+          const pre = new Image(); pre.src = u;
+          (pre.decode ? pre.decode() : Promise.resolve()).catch(() => {}).then(() => { if (img._want === time) img.src = u; });
+        }, () => { if (this === shown) { tileErr = true; } })
+          .finally(() => { this._swapping--; updLoading(); });
+      });
+      updLoading();
+    },
+    busy() { return this.isLoading() || this._swapping > 0; }
   });
 
   // ---------- Zustand ----------
@@ -417,9 +443,13 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     return j.radar.map(f => ({ t: new Date(f.timestamp), mmh: (f.precipitation_5[y]?.[x] ?? 0) * 12 / 100 }));
   }
 
+  let lastRefresh = 0, refreshing = false;
   async function refresh() {
+    if (refreshing) return;
+    refreshing = true; lastRefresh = Date.now();
+    $("reload").classList.add("busy");
     const p = load("place") || HOME;
-    $("where").textContent = p.label;
+    const keepTime = frames[idx] && idx !== nowIndex() ? +frames[idx].t : null;
     let times = frameTimes(), values = null;
     try {
       const pts = await loadPoint(p.lat, p.lon);
@@ -430,16 +460,31 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     } catch {
       pointOk = false;
     }
-    preloadRun++;
-    if (shown) { map.removeLayer(shown); shown = null; }
-    clearTileCache();
     frames = times.map((t, i) => ({ t, mmh: values ? values[i] : null }));
-    idx = 0;
+    dropOldTiles();
     document.querySelectorAll(".sk").forEach(el => el.classList.remove("sk"));
     document.body.classList.remove("booting");
+    $("where").textContent = `${p.label} · Stand ${fmt(new Date())}`;
     renderAnswer();
     renderStrip();
-    select(0);
+    const keep = keepTime ? frames.findIndex(f => +f.t === keepTime) : -1;
+    select(keep >= 0 ? keep : nowIndex());
+    preload();
+    $("reload").classList.remove("busy");
+    refreshing = false;
+  }
+  // Zeitpunkt, der "jetzt" am nächsten liegt
+  function nowIndex() {
+    let best = 0, d = Infinity;
+    frames.forEach((f, j) => { const x = Math.abs(f.t - Date.now()); if (x < d) { d = x; best = j; } });
+    return best;
+  }
+  // Kacheln für Zeitpunkte, die nicht mehr in der Zeitleiste sind, aus dem Speicher werfen
+  function dropOldTiles() {
+    const keep = new Set(frames.map(f => f.t.toISOString()));
+    [...tileCache.keys()].forEach(k => {
+      if (!keep.has(k.split("|")[0])) { tileCache.get(k).then(u => u !== EMPTY && URL.revokeObjectURL(u), () => {}); tileCache.delete(k); }
+    });
   }
 
   // Auf der Karte liegt immer nur eine Radar-Ebene: die des gewählten Zeitpunkts.
@@ -449,17 +494,17 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   function showFrame(i) {
     const f = frames[i]; if (!f) return;
     const time = f.t.toISOString();
-    if (shown && shown.options.time === time) return;
-    const old = shown;
-    const layer = new RadarLayer({ time, tileSize: TILE, zIndex: 300, updateWhenIdle: true, keepBuffer: 1 });
-    layer.on("loading load", updLoading);
-    layer.on("tileerror", () => { if (layer === shown) { tileErr = true; updLoading(); } });
-    shown = layer; tileErr = false;
-    layer.addTo(map);
-    // Altes Bild erst entfernen, wenn das neue steht. Verhindert Flackern.
-    const swap = () => { if (old) map.removeLayer(old); };
-    layer.isLoading() ? layer.once("load", swap) : swap();
-    setTimeout(swap, 4000);
+    if (!shown) {
+      shown = new RadarLayer({ time, tileSize: TILE, zIndex: 300, updateWhenIdle: true, keepBuffer: 1 });
+      shown._swapping = 0;
+      shown.on("loading load", updLoading);
+      shown.on("tileerror", () => { tileErr = true; updLoading(); });
+      tileErr = false;
+      shown.addTo(map);
+    } else {
+      tileErr = false;
+      shown.setTime(time);
+    }
     updLoading();
   }
   function rebuildRadar() {   // nach Theme-Wechsel oder neuem Datenstand: alles neu rechnen
@@ -493,7 +538,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
   function updLoading() {
     const chip = $("loadchip");
-    if (shown && shown.isLoading()) { chip.hidden = false; chip.classList.remove("err"); $("loadtxt").textContent = "Radar lädt"; return; }
+    if (shown && shown.busy()) { chip.hidden = false; chip.classList.remove("err"); $("loadtxt").textContent = "Radar lädt"; return; }
     if (tileErr) { chip.hidden = false; chip.classList.add("err"); $("loadtxt").textContent = "Radar unvollständig"; return; }
     chip.hidden = true;
   }
@@ -548,7 +593,8 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     const marks = [0, 6, 12, 18, n].filter((v, i, a) => v <= n && a.indexOf(v) === i);
     $("axis").innerHTML = marks.map(i => {
       const left = (i / n) * 100;
-      return `<span style="left:${left}%" class="${i === 0 ? "now" : ""}">${i === 0 ? "jetzt" : fmt(frames[i].t)}</span>`;
+      const isNow = i === 0 && nowIndex() === 0;
+      return `<span style="left:${left}%" class="${isNow ? "now" : ""}">${isNow ? "jetzt" : fmt(frames[i].t)}</span>`;
     }).join("");
     $("strip").setAttribute("aria-valuemax", n);
     $("empty").hidden = !frames.every(f => f.mmh != null && f.mmh < CLASSES[0].min);
@@ -565,12 +611,10 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
   function select(i) {
     idx = Math.max(0, Math.min(frames.length - 1, i));
-    const first = !shown;
     showFrame(idx);
-    if (first) preload();
     const f = frames[idx];
     const m = Math.round((f.t - Date.now()) / 60000);
-    const rel = idx === 0 ? "jetzt" : m <= 0 ? "jetzt" : `in ${m} Min.`;
+    const rel = idx === nowIndex() ? "jetzt" : m < 0 ? `vor ${-m} Min.` : `in ${m} Min.`;
     const val = f.mmh == null ? "" : f.mmh < CLASSES[0].min ? " · trocken" : ` · ${CLASSES[classOf(f.mmh)].word}`;
     $("sel").textContent = `${fmt(f.t)} · ${rel}${val}`;
     $("strip").setAttribute("aria-valuenow", idx);
@@ -629,17 +673,22 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   new ResizeObserver(() => { syncSheet(); placeCursor(); }).observe($("sheet"));
 
   // Alle 5 Minuten und beim Zurückkehren in die App aktualisieren
-  let last = 0;
-  const maybeRefresh = () => { if (document.visibilityState === "visible" && Date.now() - last > 4 * 60000) { last = Date.now(); refresh(); } };
+  // DWD liefert alle 5 Minuten ein neues Bild. Nicht nachladen, während der Griff gezogen wird.
+  const maybeRefresh = () => {
+    if (document.visibilityState !== "visible" || strip.classList.contains("dragging")) return;
+    if (Date.now() - lastRefresh >= 5 * 60000) refresh();
+    else if (frames.length) select(idx);   // "in X Min." aktuell halten
+  };
   document.addEventListener("visibilitychange", maybeRefresh);
-  setInterval(maybeRefresh, 60000);
+  window.addEventListener("focus", maybeRefresh);
+  setInterval(maybeRefresh, 30000);
+  $("reload").addEventListener("click", () => { refresh(); toast("Radar wird aktualisiert"); });
 
   // ---------- Start ----------
   applyTheme();
   setBase();
   const p0 = load("place") || HOME;
   meMarker = L.marker([p0.lat, p0.lon], { icon: L.divIcon({ className: "", html: '<div class="me"></div>', iconSize: [16, 16] }), interactive: false }).addTo(map);
-  last = Date.now();
   refresh();
   // GPS beim Start nur nachziehen, wenn der Ort der Standort ist (oder noch keiner gewählt wurde).
   // Ein per Tipp gewählter Ort bleibt erhalten.
