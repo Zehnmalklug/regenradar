@@ -476,7 +476,10 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     wantKey = key; busy = true; tileErr = false; updLoading();
     renderFrame(v, time, true).then(async u => {
       if (wantKey !== key) return;
-      if (u !== EMPTY) { const img = new Image(); img.src = u; try { await img.decode(); } catch {} }
+      if (u !== EMPTY) {   // vorab dekodieren, damit der Wechsel ohne Leerbild passiert (max. 400 ms warten)
+        const img = new Image(); img.src = u;
+        await Promise.race([img.decode().catch(() => {}), new Promise(r => setTimeout(r, 400))]);
+      }
       if (wantKey !== key) return;
       overlay.setUrl(u); overlay.setBounds(v.bounds); shownUrl = u;
       busy = false; updLoading();
