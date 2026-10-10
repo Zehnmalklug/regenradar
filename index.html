@@ -597,10 +597,11 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
       return `<div class="bar" style="height:${h}px;background:${col}"></div>`;
     }).join("");
     const n = frames.length - 1;
-    const marks = [0, 6, 12, 18, n].filter((v, i, a) => v <= n && a.indexOf(v) === i);
+    const ni = nowIndex();
+    const marks = [ni, 6, 12, 18, n].filter((v, i, a) => v <= n && a.indexOf(v) === i && (i === 0 || v - ni >= 4));
     $("axis").innerHTML = marks.map(i => {
       const left = (i / n) * 100;
-      const isNow = i === 0 && nowIndex() === 0;
+      const isNow = i === ni;
       return `<span style="left:${left}%" class="${isNow ? "now" : ""}">${isNow ? "jetzt" : fmt(frames[i].t)}</span>`;
     }).join("");
     $("strip").setAttribute("aria-valuemax", n);
