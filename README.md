@@ -11,13 +11,13 @@ Mobile Web-App (PWA): Regnet es bei mir jetzt oder in den nächsten 2 Stunden?
 - Aktualisiert sich alle 5 Minuten und beim Zurückkehren in die App
 
 ## Aufs Handy bringen
-HTTPS ist Pflicht, sonst funktionieren Standort und Installation nicht.
-
-Schnellster Weg: Ordner auf https://app.netlify.com/drop ziehen. Alternativ GitHub Pages.
+Live: https://zehnmalklug.github.io/regenradar/
 
 Auf dem Handy die URL öffnen:
-- iOS (Safari): Teilen → Zum Home-Bildschirm
 - Android (Chrome): Menü → App installieren
+- iOS (Safari): Teilen → Zum Home-Bildschirm
+
+Gehostet über GitHub Pages (Branch `main`, Root). Jeder Push auf `main` aktualisiert die App.
 
 Lokal testen: `python3 -m http.server 8000` im Ordner, dann http://localhost:8000
 
