@@ -253,27 +253,57 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     labelLayer.setUrl(`${ESRI}${v}_Reference/MapServer/tile/{z}/{y}/{x}`);
   }
 
-  // Radar-Kacheln: DWD-WMS laden und Pixel in unsere Blauskala umfärben
+  // Radar-Kacheln: DWD-WMS laden, in Regenklassen übersetzen, Kanten weich rechnen, neu einfärben.
+  // Glättung: Klassenfeld weichzeichnen und wieder in Klassen schneiden. Ergibt runde Konturen
+  // mit klaren Grenzen statt 1-km-Treppen. Die Kachel wird mit Rand geladen, damit keine Nähte entstehen.
+  const CAN_BLUR = "filter" in CanvasRenderingContext2D.prototype;
+  const STEPV = 42;   // Grauwert pro Klasse im Hilfsbild
   const RadarLayer = L.GridLayer.extend({
     createTile(coords, done) {
       const size = this.getTileSize();
       const tile = document.createElement("canvas");
       tile.width = size.x; tile.height = size.y;
-      const nw = coords.scaleBy(size), se = nw.add(size);
       const crs = L.CRS.EPSG3857;
-      const p1 = crs.project(map.unproject(nw, coords.z)), p2 = crs.project(map.unproject(se, coords.z));
+      const nwPx = coords.scaleBy(size), sePx = nwPx.add(size);
+      const nwLL = map.unproject(nwPx, coords.z), seLL = map.unproject(sePx, coords.z);
+      const p1 = crs.project(nwLL), p2 = crs.project(seLL);
+      const res = (p2.x - p1.x) / size.x;                       // projizierte Meter pro Pixel
+      const lat = (nwLL.lat + seLL.lat) / 2 * Math.PI / 180;
+      const cellPx = 1000 / Math.cos(lat) / res;                 // ein 1-km-Rasterfeld in Pixeln
+      const blur = CAN_BLUR ? Math.min(24, cellPx * 0.6) : 0;
+      const pad = blur >= 0.5 ? Math.ceil(blur * 2) + 2 : 0;
+      const W = size.x + 2 * pad, H = size.y + 2 * pad;
+      const bbox = [p1.x - pad * res, p2.y - pad * res, p2.x + pad * res, p1.y + pad * res].join(",");
       const url = `${WMS}?service=WMS&version=1.3.0&request=GetMap&layers=${LAYER}&styles=&format=image/png&transparent=true` +
-        `&crs=EPSG:3857&width=${size.x}&height=${size.y}&bbox=${p1.x},${p2.y},${p2.x},${p1.y}&time=${this.options.time}`;
+        `&crs=EPSG:3857&width=${W}&height=${H}&bbox=${bbox}&time=${this.options.time}`;
       fetch(url).then(r => r.blob()).then(createImageBitmap).then(bmp => {
-        const ctx = tile.getContext("2d", { willReadFrequently: true });
-        ctx.drawImage(bmp, 0, 0);
-        const img = ctx.getImageData(0, 0, size.x, size.y), d = img.data;
-        for (let i = 0; i < d.length; i += 4) {
-          const c = d[i + 3] === 255 ? LUT.get((d[i] << 16) | (d[i + 1] << 8) | d[i + 2]) : undefined;
-          if (c === undefined) { d[i + 3] = 0; continue; }   // kein Regen, keine Daten, Randlinie
-          const t = classRGBA[c]; d[i] = t[0]; d[i + 1] = t[1]; d[i + 2] = t[2]; d[i + 3] = t[3];
+        // 1. DWD-Farben in Klassen übersetzen (0 = kein Regen, 1..5 = Stufen) als Graubild
+        const src = document.createElement("canvas"); src.width = W; src.height = H;
+        const sctx = src.getContext("2d", { willReadFrequently: true });
+        sctx.drawImage(bmp, 0, 0);
+        const si = sctx.getImageData(0, 0, W, H), s = si.data;
+        let any = false;
+        for (let i = 0; i < s.length; i += 4) {
+          const c = s[i + 3] === 255 ? LUT.get((s[i] << 16) | (s[i + 1] << 8) | s[i + 2]) : undefined;
+          const v = c === undefined ? 0 : (c + 1) * STEPV;
+          if (v) any = true;
+          s[i] = s[i + 1] = s[i + 2] = v; s[i + 3] = 255;
         }
-        ctx.putImageData(img, 0, 0);
+        if (!any) { done(null, tile); return; }
+        sctx.putImageData(si, 0, 0);
+        // 2. Weichzeichnen
+        const soft = document.createElement("canvas"); soft.width = W; soft.height = H;
+        const fctx = soft.getContext("2d", { willReadFrequently: true });
+        if (blur >= 0.5) fctx.filter = `blur(${blur.toFixed(1)}px)`;
+        fctx.drawImage(src, 0, 0);
+        const fd = fctx.getImageData(pad, pad, size.x, size.y), f = fd.data;
+        // 3. Zurück in Klassen schneiden und einfärben
+        for (let i = 0; i < f.length; i += 4) {
+          const c = Math.round(f[i] / STEPV) - 1;
+          if (c < 0) { f[i + 3] = 0; continue; }
+          const t = classRGBA[Math.min(c, 4)]; f[i] = t[0]; f[i + 1] = t[1]; f[i + 2] = t[2]; f[i + 3] = t[3];
+        }
+        tile.getContext("2d").putImageData(fd, 0, 0);
         done(null, tile);
       }).catch(err => done(err, tile));
       return tile;
