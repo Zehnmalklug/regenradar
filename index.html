@@ -12,8 +12,13 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="icon-180.png">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://unpkg.com">
+<link rel="preconnect" href="https://maps.dwd.de" crossorigin>
+<link rel="preconnect" href="https://api.brightsky.dev" crossorigin>
+<link rel="preconnect" href="https://services.arcgisonline.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..24,400..600,0..1,0&icon_names=brightness_auto,dark_mode,drag_indicator,light_mode,my_location,water_drop&display=block">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..24,400..600,0..1,0&icon_names=brightness_auto,dark_mode,drag_indicator,light_mode,my_location,water_drop&display=block" media="print" onload="this.media='all'">
 <style>
 /* Layout: Antwort oben, Karte in der Mitte, Regenverlauf für deinen Ort unten als Zeitleiste */
 :root {
@@ -125,10 +130,28 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(var(--sheet-h, 220px) + 12px); z-index: 600;
   border-radius: 12px; padding: 8px 12px; font-size: 12px; max-width: calc(100% - 32px); }
 .me { width: 16px; height: 16px; border-radius: 50%; background: var(--accent); border: 3px solid #fff; box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 25%, transparent); }
-@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+/* Skeleton beim ersten Laden */
+.sk { color: transparent !important; border-radius: 6px; background: linear-gradient(90deg, var(--line) 0 40%, color-mix(in srgb, var(--line) 45%, var(--panel-solid)) 50%, var(--line) 60% 100%);
+  background-size: 300% 100%; animation: sk 1.4s linear infinite; }
+#headline.sk { width: 12em; max-width: 100%; }
+#sub.sk { width: 9em; max-width: 80%; margin-top: 6px; }
+#where.sk { width: 5em; }
+#sel.sk { width: 11em; display: inline-block; }
+.bar.skb { animation: sk 1.4s linear infinite; background: linear-gradient(90deg, var(--line) 0 40%, color-mix(in srgb, var(--line) 45%, var(--panel-solid)) 50%, var(--line) 60% 100%) fixed; background-size: 300% 100%; }
+@keyframes sk { from { background-position: 100% 0; } to { background-position: 0 0; } }
+.booting .handle, .booting .cursor { opacity: 0; }
+
+/* Ladeanzeige für Radarbilder */
+.head { justify-content: space-between; gap: 8px; }
+.loadchip { flex: none; display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.loadchip.err { color: var(--fg); }
+.spin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--line); border-top-color: var(--accent); animation: spin .8s linear infinite; }
+.loadchip.err .spin { display: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } .sk, .bar.skb { animation: none; } .spin { animation-duration: 2.4s; } }
 </style>
 </head>
-<body>
+<body class="booting">
 <div id="map" aria-label="Karte mit Regenradar"></div>
 
 <div class="top">
@@ -137,9 +160,9 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
       <span class="ms">water_drop</span>
     </div>
     <div class="txt">
-      <h1 id="headline">Lade Vorhersage …</h1>
-      <p id="sub">Regen für die nächsten 2 Stunden</p>
-      <span class="where" id="where"></span>
+      <h1 id="headline" class="sk">Lade Vorhersage …</h1>
+      <p id="sub" class="sk">Regen für die nächsten 2 Stunden</p>
+      <span class="where sk" id="where">Ort</span>
     </div>
   </div>
   <div class="btns">
@@ -156,7 +179,8 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 <div class="panel sheet" id="sheet">
   <div class="head">
-    <span class="sel" id="sel">--:--</span>
+    <span class="sel sk" id="sel">--:--</span>
+    <span class="loadchip" id="loadchip" role="status" hidden><span class="spin" aria-hidden="true"></span><span id="loadtxt">Radar lädt</span></span>
   </div>
   <div class="strip" id="strip" role="slider" aria-label="Zeitpunkt wählen" tabindex="0" aria-valuemin="0" aria-valuemax="24" aria-valuenow="0">
     <div class="bars" id="bars"></div>
@@ -174,6 +198,11 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     </div>
 </div>
 
+<script>
+  // Skeleton-Balken sofort zeichnen, noch bevor Karte und Daten geladen sind
+  document.getElementById("bars").innerHTML = Array.from({ length: 25 }, (_, i) =>
+    `<div class="bar skb" style="height:${10 + ((i * 7) % 5) * 6}px"></div>`).join("");
+</script>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 (() => {
@@ -277,7 +306,10 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
       const bbox = [p1.x - pad * res, p2.y - pad * res, p2.x + pad * res, p1.y + pad * res].join(",");
       const url = `${WMS}?service=WMS&version=1.3.0&request=GetMap&layers=${LAYER}&styles=&format=image/png&transparent=true` +
         `&crs=EPSG:3857&width=${W}&height=${H}&bbox=${bbox}&time=${this.options.time}`;
-      fetch(url).then(r => r.blob()).then(createImageBitmap).then(bmp => {
+      const layer = this;
+      enqueue(() => {
+        if (!layer._map) { done(null, tile); return Promise.resolve(); }   // Ebene inzwischen verworfen
+        return fetch(url).then(r => { if (!r.ok) throw new Error(r.status); return r.blob(); }).then(createImageBitmap).then(bmp => {
         // 1. DWD-Farben in Klassen übersetzen (0 = kein Regen, 1..5 = Stufen) als Graubild
         const src = document.createElement("canvas"); src.width = W; src.height = H;
         const sctx = src.getContext("2d", { willReadFrequently: true });
@@ -307,9 +339,21 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
         tile.getContext("2d").putImageData(fd, 0, 0);
         done(null, tile);
       }).catch(err => done(err, tile));
+      }, layer === frames[idx]?.layer);
       return tile;
     }
   });
+
+  // ---------- Ladesteuerung ----------
+  // Höchstens 6 Radar-Anfragen gleichzeitig. Das gerade gezeigte Bild hat Vorrang.
+  const MAX_PAR = 6; let active = 0; const queue = [];
+  function enqueue(job, prio) { prio ? queue.unshift(job) : queue.push(job); pump(); }
+  function pump() {
+    while (active < MAX_PAR && queue.length) {
+      const job = queue.shift(); active++;
+      Promise.resolve().then(job).catch(() => {}).finally(() => { active--; pump(); });
+    }
+  }
 
   // ---------- Zustand ----------
   let frames = [];     // {t: Date, mmh: number|null, layer}
@@ -344,21 +388,60 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     } catch {
       pointOk = false;
     }
-    frames.forEach(f => f.layer && map.removeLayer(f.layer));
+    dropLayers(true);
     frames = times.map((t, i) => ({ t, mmh: values ? values[i] : null }));
     idx = 0;
-    rebuildRadar();
+    document.querySelectorAll(".sk").forEach(el => el.classList.remove("sk"));
+    document.body.classList.remove("booting");
     renderAnswer();
     renderStrip();
     select(0);
   }
 
-  function rebuildRadar() {
-    frames.forEach(f => {
-      if (f.layer) map.removeLayer(f.layer);
-      f.layer = new RadarLayer({ time: f.t.toISOString(), tileSize: 512, opacity: 0, zIndex: 300, updateWhenIdle: true }).addTo(map);
-    });
-    if (frames[idx]) frames[idx].layer.setOpacity(1);
+  // Nur das gewählte Bild lädt sofort. Die übrigen Zeitpunkte folgen nacheinander im Hintergrund,
+  // sobald das aktuelle Bild steht. Beim Verschieben oder Zoomen werden sie verworfen und später neu geladen.
+  let preloadRun = 0;
+  function ensureLayer(i) {
+    const f = frames[i];
+    if (!f.layer) {
+      f.layer = new RadarLayer({ time: f.t.toISOString(), tileSize: 512, opacity: 0, zIndex: 300, updateWhenIdle: true, keepBuffer: 0 });
+      f.layer.on("loading load", updLoading);
+      f.layer.on("tileerror", () => { if (f.layer === frames[idx]?.layer) tileErr = true; });
+    }
+    if (!f.layer._map) f.layer.addTo(map);
+    return f.layer;
+  }
+  function dropLayers(all) {
+    frames.forEach((f, j) => { if (f.layer && (all || j !== idx)) { map.removeLayer(f.layer); if (all) f.layer = null; } });
+  }
+  function rebuildRadar() {   // nach Theme-Wechsel oder neuem Datenstand: alles neu zeichnen
+    dropLayers(true);
+    if (frames.length) select(idx);
+  }
+  const whenLoaded = layer => new Promise(res => {
+    if (!layer.isLoading()) return res();
+    const t = setTimeout(res, 15000);
+    layer.once("load", () => { clearTimeout(t); res(); });
+  });
+  async function preload() {
+    const run = ++preloadRun;
+    const cur = frames[idx]?.layer; if (!cur) return;
+    await whenLoaded(cur);
+    const order = frames.map((_, j) => j).filter(j => j !== idx).sort((a, b) => Math.abs(a - idx) - Math.abs(b - idx));
+    for (const j of order) {
+      if (run !== preloadRun) return;
+      await whenLoaded(ensureLayer(j));
+    }
+  }
+  map.on("movestart", () => { preloadRun++; dropLayers(false); });
+  map.on("moveend", () => preload());
+
+  let tileErr = false;
+  function updLoading() {
+    const cur = frames[idx]?.layer, chip = $("loadchip");
+    if (cur && cur.isLoading()) { chip.hidden = false; chip.classList.remove("err"); $("loadtxt").textContent = "Radar lädt"; tileErr = false; return; }
+    if (tileErr) { chip.hidden = false; chip.classList.add("err"); $("loadtxt").textContent = "Radar unvollständig"; return; }
+    chip.hidden = true;
   }
 
   // ---------- Antwort ----------
@@ -427,8 +510,12 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   }
 
   function select(i) {
+    const prev = idx;
     idx = Math.max(0, Math.min(frames.length - 1, i));
+    ensureLayer(idx);
     frames.forEach((f, j) => f.layer && f.layer.setOpacity(j === idx ? 1 : 0));
+    if (prev !== idx || !frames.some((f, j) => j !== idx && f.layer && f.layer._map)) preload();
+    updLoading();
     const f = frames[idx];
     const m = Math.round((f.t - Date.now()) / 60000);
     const rel = idx === 0 ? "jetzt" : m <= 0 ? "jetzt" : `in ${m} Min.`;
