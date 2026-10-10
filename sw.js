@@ -1,5 +1,5 @@
 // Cacht nur die App-Hülle. Radarbilder und Karten kommen immer frisch aus dem Netz.
-const CACHE = "regenradar-v5";
+const CACHE = "regenradar-v6";
 const SHELL = ["./", "index.html", "manifest.webmanifest", "icon.svg", "icon-180.png", "icon-192.png", "icon-512.png"];
 
 self.addEventListener("install", e => {
