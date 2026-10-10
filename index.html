@@ -349,6 +349,68 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     return v && v.zoom === map.getZoom() && v.bounds.contains(map.getBounds());
   }
 
+  // Bildverarbeitung im Hintergrund-Thread (Web Worker), damit Scrubben und Karte flüssig bleiben.
+  // Fällt auf den Haupt-Thread zurück, wenn der Browser das nicht kann.
+  const PROCESS_SRC = `
+    async function processFrame(o) {
+      const r = await fetch(o.url);
+      if (!r.ok) throw new Error(r.status);
+      const bmp = await createImageBitmap(await r.blob());
+      const mk = (w, h) => typeof OffscreenCanvas !== "undefined" ? new OffscreenCanvas(w, h) : Object.assign(document.createElement("canvas"), { width: w, height: h });
+      const lut = new Map(o.lut);
+      // 1. DWD-Farben in Klassen übersetzen (0 = kein Regen, 1..5 = Stufen) als Graubild
+      const src = mk(o.W, o.H), sctx = src.getContext("2d", { willReadFrequently: true });
+      sctx.drawImage(bmp, 0, 0); bmp.close && bmp.close();
+      const si = sctx.getImageData(0, 0, o.W, o.H), s = si.data;
+      let any = false;
+      for (let i = 0; i < s.length; i += 4) {
+        const c = s[i + 3] === 255 ? lut.get((s[i] << 16) | (s[i + 1] << 8) | s[i + 2]) : undefined;
+        const v = c === undefined ? 0 : (c + 1) * o.stepv;
+        if (v) any = true;
+        s[i] = s[i + 1] = s[i + 2] = v; s[i + 3] = 255;
+      }
+      if (!any) return null;
+      sctx.putImageData(si, 0, 0);
+      // 2. Weichzeichnen: Klassenfeld weich, dann wieder in Stufen schneiden = runde Konturen
+      const soft = mk(o.W, o.H), fctx = soft.getContext("2d", { willReadFrequently: true });
+      if (o.blur >= 0.5 && "filter" in fctx) fctx.filter = "blur(" + o.blur.toFixed(1) + "px)";
+      fctx.drawImage(src, 0, 0);
+      const fd = fctx.getImageData(o.pad, o.pad, o.w, o.hh), f = fd.data;
+      // 3. Einfärben
+      for (let i = 0; i < f.length; i += 4) {
+        const c = Math.round(f[i] / o.stepv) - 1;
+        if (c < 0) { f[i + 3] = 0; continue; }
+        const t = o.rgba[Math.min(c, 4)]; f[i] = t[0]; f[i + 1] = t[1]; f[i + 2] = t[2]; f[i + 3] = t[3];
+      }
+      const out = mk(o.w, o.hh);
+      out.getContext("2d").putImageData(fd, 0, 0);
+      return out.convertToBlob ? out.convertToBlob({ type: "image/png" }) : new Promise(r => out.toBlob(r, "image/png"));
+    }
+  `;
+  let workers = [], nextWorker = 0, jobSeq = 0;
+  const jobs = new Map();
+  try {
+    const off = typeof OffscreenCanvas !== "undefined" && "filter" in new OffscreenCanvas(1, 1).getContext("2d");
+    if (off) {
+      const wurl = URL.createObjectURL(new Blob([PROCESS_SRC + `
+        onmessage = async e => {
+          try { postMessage({ id: e.data.id, blob: await processFrame(e.data.o) }); }
+          catch (err) { postMessage({ id: e.data.id, err: String(err) }); }
+        };`], { type: "text/javascript" }));
+      workers = [new Worker(wurl), new Worker(wurl)];
+      workers.forEach(w => w.onmessage = e => {
+        const j = jobs.get(e.data.id); if (!j) return; jobs.delete(e.data.id);
+        e.data.err ? j.rej(new Error(e.data.err)) : j.res(e.data.blob);
+      });
+    }
+  } catch { workers = []; }
+  const mainProcess = new Function(PROCESS_SRC + "; return processFrame;")();
+  function processFrame(o) {
+    if (!workers.length) return mainProcess(o);
+    const id = ++jobSeq, w = workers[nextWorker++ % workers.length];
+    return new Promise((res, rej) => { jobs.set(id, { res, rej }); w.postMessage({ id, o }); });
+  }
+
   function renderFrame(v, time, prio, run) {
     const key = `${v.id}|${time}`;
     if (frameCache.has(key)) return frameCache.get(key);
@@ -359,39 +421,8 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
       const bbox = [v.x0 - pad * res, v.y0 - pad * res, v.x1 + pad * res, v.y1 + pad * res].join(",");
       const url = `${WMS}?service=WMS&version=1.3.0&request=GetMap&layers=${LAYER}&styles=&format=image/png&transparent=true` +
         `&crs=EPSG:3857&width=${W}&height=${H}&bbox=${bbox}&time=${time}`;
-      const r = await fetch(url);
-      if (!r.ok) throw new Error(r.status);
-      const bmp = await createImageBitmap(await r.blob());
-      // 1. DWD-Farben in Klassen übersetzen (0 = kein Regen, 1..5 = Stufen) als Graubild
-      const src = document.createElement("canvas"); src.width = W; src.height = H;
-      const sctx = src.getContext("2d", { willReadFrequently: true });
-      sctx.drawImage(bmp, 0, 0); bmp.close?.();
-      const si = sctx.getImageData(0, 0, W, H), s = si.data;
-      let any = false;
-      for (let i = 0; i < s.length; i += 4) {
-        const c = s[i + 3] === 255 ? LUT.get((s[i] << 16) | (s[i + 1] << 8) | s[i + 2]) : undefined;
-        const val = c === undefined ? 0 : (c + 1) * STEPV;
-        if (val) any = true;
-        s[i] = s[i + 1] = s[i + 2] = val; s[i + 3] = 255;
-      }
-      if (!any) { src.width = 0; return EMPTY; }
-      sctx.putImageData(si, 0, 0);
-      // 2. Weichzeichnen: Klassenfeld weich, dann wieder in Stufen schneiden = runde Konturen
-      const soft = document.createElement("canvas"); soft.width = W; soft.height = H;
-      const fctx = soft.getContext("2d", { willReadFrequently: true });
-      if (v.blur >= 0.5) fctx.filter = `blur(${v.blur.toFixed(1)}px)`;
-      fctx.drawImage(src, 0, 0);
-      const fd = fctx.getImageData(pad, pad, w, hh), f = fd.data;
-      // 3. Einfärben
-      for (let i = 0; i < f.length; i += 4) {
-        const c = Math.round(f[i] / STEPV) - 1;
-        if (c < 0) { f[i + 3] = 0; continue; }
-        const t = classRGBA[Math.min(c, 4)]; f[i] = t[0]; f[i + 1] = t[1]; f[i + 2] = t[2]; f[i + 3] = t[3];
-      }
-      const out = document.createElement("canvas"); out.width = w; out.height = hh;
-      out.getContext("2d").putImageData(fd, 0, 0);
-      const blob = await new Promise(res2 => out.toBlob(res2, "image/png"));
-      src.width = soft.width = out.width = 0;   // Grafikspeicher sofort freigeben
+      const blob = await processFrame({ url, W, H, w, hh, pad, blur: v.blur, stepv: STEPV, lut: [...LUT], rgba: classRGBA });
+      if (!blob) return EMPTY;
       return URL.createObjectURL(blob);
     }, prio);
     frameCache.set(key, p);
