@@ -220,12 +220,14 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   const PLACE_ZOOM = 10;   // Startansicht: Ort mit Umgebung von etwa 30 km
 
   // Klassen in mm/h. Gleiche Schwellen für Karte und Punktwert.
+  // Schwellen exakt wie die DWD-Farbskala der Karte (Werte dort in mm pro 5 Minuten, hier × 12 = mm/h).
+  // So bedeuten Kartenfarbe und Text immer dasselbe.
   const CLASSES = [
-    { min: 0.1, word: "Niesel" },
-    { min: 0.4, word: "leichter Regen" },
-    { min: 2,   word: "mäßiger Regen" },
-    { min: 5,   word: "starker Regen" },
-    { min: 15,  word: "Unwetter" },
+    { min: 0.008 * 12, word: "Niesel" },          // ab 0,1 mm/h
+    { min: 0.033 * 12, word: "leichter Regen" },  // ab 0,4 mm/h
+    { min: 0.167 * 12, word: "mäßiger Regen" },   // ab 2 mm/h
+    { min: 0.417 * 12, word: "starker Regen" },   // ab 5 mm/h
+    { min: 1.25 * 12,  word: "Unwetter" },        // ab 15 mm/h
   ];
   const classOf = mmh => { let c = -1; CLASSES.forEach((k, i) => { if (mmh >= k.min) c = i; }); return c; };
 
@@ -440,7 +442,25 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     return Array.from({ length: 25 }, (_, i) => new Date(t0 + i * STEP));
   }
 
+  // Regen am Ort: direkt aus derselben DWD-Ebene wie die Karte (GetFeatureInfo), alle Zeitpunkte in einer Anfrage.
+  // Gleiche Daten, gleicher Vorhersagelauf, volle Genauigkeit.
   async function loadPoint(lat, lon) {
+    const e = 0.005, iso = d => d.toISOString().replace(/\.\d+Z$/, ".000Z");
+    const from = new Date(Math.floor((Date.now() - 15 * 60000) / STEP) * STEP), to = new Date(+from + 140 * 60000);
+    const url = `${WMS}?service=WMS&version=1.1.1&request=GetFeatureInfo&layers=${LAYER}&query_layers=${LAYER}&styles=` +
+      `&srs=EPSG:4326&bbox=${lon - e},${lat - e},${lon + e},${lat + e}&width=3&height=3&x=1&y=1` +
+      `&info_format=application/json&feature_count=100&time=${iso(from)}/${iso(to)}`;
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(r.status);
+    const feats = (await r.json()).features || [];
+    if (!feats.length) throw new Error("keine Daten");   // z. B. außerhalb der Radarabdeckung
+    return feats.map(f => {
+      const pr = f.properties, v = pr.RV_ANALYSIS ?? Object.values(pr).find(x => typeof x === "number") ?? 0;
+      return { t: new Date(pr.TIME), mmh: Math.max(0, v) * 12 };   // mm pro 5 Min. -> mm/h
+    }).sort((a, b) => a.t - b.t);
+  }
+  // Ersatz, falls der DWD-Server nicht antwortet. Bright Sky rundet auf 0,01 mm ab, daher etwas ungenauer.
+  async function loadPointBrightSky(lat, lon) {
     const date = new Date(Date.now() - 10 * 60000).toISOString();
     const r = await fetch(`${BRIGHTSKY}?lat=${lat}&lon=${lon}&distance=1000&format=plain&date=${encodeURIComponent(date)}`);
     if (!r.ok) throw new Error(r.status);
@@ -459,7 +479,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     const keepTime = frames[idx] && idx !== nowIndex() ? +frames[idx].t : null;
     let times = frameTimes(), values = null;
     try {
-      const pts = await loadPoint(p.lat, p.lon);
+      const pts = await loadPoint(p.lat, p.lon).catch(() => loadPointBrightSky(p.lat, p.lon));
       const cut = Date.now() - STEP;
       const fut = pts.filter(f => +f.t >= cut);
       if (fut.length) { times = fut.map(f => f.t); values = fut.map(f => f.mmh); }

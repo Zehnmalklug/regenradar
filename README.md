@@ -23,15 +23,15 @@ Lokal testen: `python3 -m http.server 8000` im Ordner, dann http://localhost:800
 
 ## Datenquellen
 - Karte: DWD GeoServer WMS, Layer `dwd:Niederschlagsradar` (mm/h, Messung und Nowcast bis +2 Std.). Die Kacheln werden im Browser in die eigene Blauskala umgefärbt
-- Punktwert für deinen Ort: Bright Sky API `/radar` (DWD RV-Produkt, 1 km Raster)
+- Punktwert für deinen Ort: dieselbe DWD-Ebene per `GetFeatureInfo` (alle Zeitpunkte in einer Anfrage). Ersatz bei Ausfall: Bright Sky API `/radar`
 - Basiskarte: Esri Light/Dark Gray Canvas
 
 Quellenvermerk "Deutscher Wetterdienst" ist Pflicht und steht in der Attribution.
 
 ## Klassen (mm/h)
-Niesel ab 0,1 · leicht ab 0,4 · mäßig ab 2 · stark ab 5 · Unwetter ab 15
+Niesel ab 0,1 · leicht ab 0,4 · mäßig ab 2 · stark ab 5 · Unwetter ab 15 (exakt die Grenzen der DWD-Farbskala)
 
 ## Bekannte Grenzen
 - Abdeckung nur Deutschland plus Grenzgebiet
-- Karte und Punktwert kommen aus zwei DWD-Produkten. Sie stimmen fast immer überein, aber nicht garantiert pixelgenau
+- Die Karte ist geglättet. Direkt an Grenzen zwischen zwei Stufen kann die Farbe am Ort um eine Stufe vom Text abweichen
 - Esri-Basiskarten sind für private, nicht-kommerzielle Nutzung frei. Für ein öffentliches Produkt Lizenz klären
